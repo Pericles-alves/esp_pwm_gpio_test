@@ -1,113 +1,138 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_random.h"
-
-#include "driver/gpio.h"
-#include "esp_random.h"
-#include "esp_log.h"
-
-#define TAG "RAND_GPIO"
-
-#define NUM_OUTPUTS 4
+#include "esp_timer.h"
 
 #define TAG "PWM_RANDOM"
+#define NUM_OUTPUTS 4
 
 // Change these GPIOs as needed
-#define PWM_GPIO_0    4
-#define PWM_GPIO_1    5
-#define PWM_GPIO_2    6
-#define PWM_GPIO_3    7
+#define PWM_GPIO_0    GPIO_NUM_4
+#define PWM_GPIO_1    GPIO_NUM_5
+#define PWM_GPIO_2    GPIO_NUM_6
+#define PWM_GPIO_3    GPIO_NUM_7
 
-#define PWM_MIN_FREQ  500
-#define PWM_MAX_FREQ  3800
+#define PWM_MIN_FREQ  5
+#define PWM_MAX_FREQ  15
 
 #define NUM_PWM       4
+#define LED_BLINK_FREQUENCY_HZ 20U
+#define LED_BLINK_HALF_PERIOD_US \
+    (1000000U / (2U * LED_BLINK_FREQUENCY_HZ))
 
 typedef enum {
     MACHINE_RUNNING,
     MACHINE_FAULT
 } machine_state_t;
 
+typedef enum {
+    LED_STATE_OFF = 0,
+    LED_STATE_ON,
+    LED_STATE_BLINKING,
+} led_state_t;
+
 typedef struct {
     machine_state_t state;
     uint32_t pwm_freq[NUM_PWM];
-    uint8_t led_state[NUM_OUTPUTS];
+    led_state_t led_state[NUM_OUTPUTS];
     uint8_t led_blink_mask;
     int failed_roller;
     TickType_t state_start;
 } machine_t;
 
 static machine_t machine;
+static portMUX_TYPE machine_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void apply_pwm(void);
+
+static led_state_t random_led_state(void)
+{
+    return (led_state_t)((esp_random() % 3U));
+}
+
+static uint8_t get_led_blink_mask(const led_state_t *states)
+{
+    uint8_t blink_mask = 0;
+
+    for (int i = 0; i < NUM_OUTPUTS; i++) {
+        if (states[i] == LED_STATE_BLINKING) {
+            blink_mask |= BIT(i);
+        }
+    }
+
+    return blink_mask;
+}
 
 static void machine_start_cycle(void)
 {
+    led_state_t led_states[NUM_OUTPUTS];
+
+    for (int i = 0; i < NUM_OUTPUTS; i++) {
+        led_states[i] = random_led_state();
+    }
+
+    portENTER_CRITICAL(&machine_lock);
     machine.state = MACHINE_RUNNING;
     machine.state_start = xTaskGetTickCount();
+    for (int i = 0; i < NUM_OUTPUTS; i++) {
+        machine.led_state[i] = led_states[i];
+    }
+    machine.led_blink_mask = get_led_blink_mask(led_states);
+    portEXIT_CRITICAL(&machine_lock);
 
     ESP_LOGI(TAG, "======================================");
     ESP_LOGI(TAG, "Starting new production cycle");
 
-    for (int i = 0; i < NUM_PWM; i++){
-        machine.pwm_freq[i] =  PWM_MIN_FREQ + esp_random() % PWM_MAX_FREQ;
+    for (int i = 0; i < NUM_PWM; i++) {
+        machine.pwm_freq[i] = PWM_MIN_FREQ +
+                      (esp_random() %
+                       (PWM_MAX_FREQ - PWM_MIN_FREQ + 1U));
         ESP_LOGI(TAG,
                  "Roller %d -> %lu Hz",
                  i,
                  (unsigned long)machine.pwm_freq[i]);
     }
-    uint8_t leds = esp_random() & 0x0F;
 
     ESP_LOGI(TAG,
-             "LED Pattern: %d %d %d %d",
-             (leds >> 0) & 1,
-             (leds >> 1) & 1,
-             (leds >> 2) & 1,
-             (leds >> 3) & 1);
-
-    for (int i = 0; i < NUM_OUTPUTS; i++){
-        machine.led_state[i] = (leds >> i) & 1;
-    }
-    machine.led_blink_mask = 0;
+             "LED States: %d %d %d %d",
+             led_states[0],
+             led_states[1],
+             led_states[2],
+             led_states[3]);
     ESP_LOGI(TAG, "Machine RUNNING");
     ESP_LOGI(TAG, "======================================");
+
+    apply_pwm();
 }
+
 static void machine_fault(void)
 {
+    int failed_roller = esp_random() % NUM_PWM;
+
+    portENTER_CRITICAL(&machine_lock);
     machine.state = MACHINE_FAULT;
     machine.state_start = xTaskGetTickCount();
-    machine.failed_roller = esp_random() % NUM_PWM;
-    machine.pwm_freq[machine.failed_roller] = 0;
+    machine.failed_roller = failed_roller;
+    machine.pwm_freq[failed_roller] = 0;
+    machine.led_state[failed_roller] = LED_STATE_BLINKING;
+    machine.led_blink_mask = get_led_blink_mask(machine.led_state);
+    portEXIT_CRITICAL(&machine_lock);
 
-    switch (machine.failed_roller)
-    {
-        case 0:
-            machine.led_blink_mask = BIT0;
-            break;
-
-        case 1:
-            machine.led_blink_mask = BIT1;
-            break;
-
-        case 2:
-            machine.led_blink_mask = BIT2;
-            break;
-
-        case 3:
-            machine.led_blink_mask = BIT3;
-            break;
-    }
     ESP_LOGW(TAG, "######################################");
     ESP_LOGW(TAG, "FAULT DETECTED");
-    ESP_LOGW(TAG, "Stopped Roller : %d", machine.failed_roller);
+    ESP_LOGW(TAG, "Stopped Roller : %d", failed_roller);
     ESP_LOGW(TAG, "Blink Mask     : 0x%02X", machine.led_blink_mask);
     ESP_LOGW(TAG, "Machine entered FAULT state");
     ESP_LOGW(TAG, "######################################");
+
+    apply_pwm();
 }
 
 static const int pwm_gpios[NUM_PWM] = {
@@ -159,55 +184,71 @@ static const gpio_num_t output_pins[NUM_OUTPUTS] = {
 };
 
 
-void apply_pwm(void)
+static void apply_pwm(void)
 {
     for (int i = 0; i < NUM_PWM; i++)
     {
+        if (machine.pwm_freq[i] == 0) {
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,
+                                          pwm_channels[i],
+                                          0));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,
+                                             pwm_channels[i]));
+            continue;
+        }
+
         ledc_timer_bit_t resolution =
-            choose_resolution(machine.pwm_freq[i] == 0 ?
-                              500 :
-                              machine.pwm_freq[i]);
+            choose_resolution(machine.pwm_freq[i]);
 
         ledc_timer_config_t timer_cfg = {
             .speed_mode = LEDC_LOW_SPEED_MODE,
             .duty_resolution = resolution,
             .timer_num = (ledc_timer_t)i,
-            .freq_hz = machine.pwm_freq[i] == 0 ?
-                       500 :
-                       machine.pwm_freq[i],
+            .freq_hz = machine.pwm_freq[i],
             .clk_cfg = LEDC_AUTO_CLK,
         };
 
         ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
 
-        uint32_t max_duty = (1 << resolution) - 1;
+        uint32_t half_duty = 1U << (resolution - 1);
 
-        if(machine.pwm_freq[i] == 0)
-            ledc_set_duty(LEDC_LOW_SPEED_MODE,
-                          pwm_channels[i],
-                          0);
-        else
-            ledc_set_duty(LEDC_LOW_SPEED_MODE,
-                          pwm_channels[i],
-                          max_duty/2);
-
-        ledc_update_duty(LEDC_LOW_SPEED_MODE,
-                         pwm_channels[i]);
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,
+                                      pwm_channels[i],
+                                      half_duty));
+        ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,
+                                         pwm_channels[i]));
     }
 }
 
-void apply_leds(void)
+static void apply_leds(bool blink_phase)
 {
-    bool blink = ((xTaskGetTickCount() / pdMS_TO_TICKS(50)) & 1);
+    led_state_t led_states[NUM_OUTPUTS];
 
-    for(int i=0;i<NUM_OUTPUTS;i++){
-        bool level = machine.led_state[i];
+    portENTER_CRITICAL(&machine_lock);
+    for (int i = 0; i < NUM_OUTPUTS; i++) {
+        led_states[i] = machine.led_state[i];
+    }
+    portEXIT_CRITICAL(&machine_lock);
 
-        if(machine.led_blink_mask & BIT(i))
-            level = blink;
+    for (int i = 0; i < NUM_OUTPUTS; i++) {
+        bool level = led_states[i] == LED_STATE_ON;
+
+        if (led_states[i] == LED_STATE_BLINKING) {
+            level = blink_phase;
+        }
 
         gpio_set_level(output_pins[i], level);
     }
+}
+
+static bool led_blink_phase;
+
+static void led_timer_callback(void *arg)
+{
+    (void)arg;
+
+    led_blink_phase = !led_blink_phase;
+    apply_leds(led_blink_phase);
 }
 
 void machine_update(void)
@@ -215,7 +256,7 @@ void machine_update(void)
     TickType_t elapsed =
         xTaskGetTickCount() - machine.state_start;
 
-    switch(machine.state)
+    switch (machine.state)
     {
         case MACHINE_RUNNING:
             if(elapsed > pdMS_TO_TICKS(15000)){
@@ -287,8 +328,6 @@ void machine_status_log(void)
 
 void app_main(void)
 {
-    // Seed standard rand() if desired
-    srand((unsigned int)time(NULL));
     random_gpio_outputs_init();
 
     for (int i = 0; i < NUM_PWM; i++) {
@@ -328,16 +367,24 @@ void app_main(void)
     }
 
     machine_start_cycle();
-    apply_pwm();
-    apply_leds();
+    led_blink_phase = false;
+    apply_leds(false);
+
+    const esp_timer_create_args_t led_timer_args = {
+        .callback = led_timer_callback,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "led_blink_timer",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_handle_t led_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&led_timer_args, &led_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(led_timer,
+                                             LED_BLINK_HALF_PERIOD_US));
 
     while (1)
     {
         machine_update();
-
-        apply_pwm();
-
-        apply_leds();
 
         machine_status_log();
 
